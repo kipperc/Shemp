@@ -11,7 +11,7 @@ import pytz
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
 DISCORD_TOKEN = "DISCORD_TOKEN"
-POLL_INTERVAL = 30
+POLL_INTERVAL = 15
 ALERT_LEAD_MINUTES = [60, 30, 5]
 
 DATA_FILE = "alerts_sent.json"
@@ -259,6 +259,67 @@ async def createroles(interaction: discord.Interaction):
         msg = f"✅ Created **{created_count}** missing boss roles."
 
     await interaction.followup.send(msg, ephemeral=True)
+    
+@bot.tree.command(name="testpoll", description="Force the bot to post alerts for the next bosses.")
+async def testpoll(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = str(interaction.guild_id)
+    channel_id = bot.guild_config.get(guild_id, {}).get("channel_id")
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await interaction.followup.send("Alert channel not set! Use /setupalerts first.", ephemeral=True)
+        return
+
+    now = datetime.now(timezone.utc)
+    try:
+        bosses = await fetch_bosses("NA")
+        if not bosses:
+            await interaction.followup.send("⚠️ No boss data available.", ephemeral=True)
+            return
+
+        # Find next spawn per boss
+        next_spawns = {}
+        for boss in bosses:
+            spawn_utc = parse_time_str_to_utc(boss["time_str"])
+            if spawn_utc < now:
+                continue
+            if boss["name"] not in next_spawns or spawn_utc < next_spawns[boss["name"]]:
+                next_spawns[boss["name"]] = spawn_utc
+
+        if not next_spawns:
+            await interaction.followup.send("⚠️ No upcoming boss spawns found.", ephemeral=True)
+            return
+
+        # Compose alert messages like the poll loop
+        messages_to_send = []
+        for name, spawn in next_spawns.items():
+            minutes_until = max(int((spawn - now).total_seconds() // 60), 0)
+            role = bot.boss_roles.get(name)
+            mention = role.mention if role else name
+            messages_to_send.append(f"⚠️ {mention} spawns in {minutes_until} minutes! [TEST]")
+
+        if messages_to_send:
+            # Delete previous alert if exists
+            last_msg_id = bot.sent_alert_msg.get(guild_id)
+            if last_msg_id:
+                try:
+                    last_msg = await channel.fetch_message(last_msg_id)
+                    await last_msg.delete()
+                except Exception:
+                    pass
+
+            new_msg = await channel.send("\n".join(messages_to_send))
+            bot.sent_alert_msg[guild_id] = new_msg.id
+            bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
+
+            await interaction.followup.send(f"✅ Test poll sent for {len(messages_to_send)} bosses.", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ No bosses to alert.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
+
 
 
         
@@ -352,9 +413,13 @@ async def poll_and_alert():
                     pass  # message may have been deleted manually
 
             # Send new alert and store its message ID
-            new_msg = await channel.send("\n".join(messages_to_send))
-            bot.sent_alert_msg[guild_id] = new_msg.id
-            bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
+            try:
+                new_msg = await channel.send("\n".join(messages_to_send))
+                bot.sent_alert_msg[guild_id] = new_msg.id
+                bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
+            except Exception as e:
+                print(f"❌ Failed to send alert in guild {guild_id}: {e}")
+
 
 
 # ─── On Ready ─────────────────────────────────────────────────────────
@@ -362,17 +427,55 @@ async def poll_and_alert():
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     print("UTC now:", datetime.now(timezone.utc))
-    print("Local now:", datetime.now())
+    print("Local now:", datetime.now())  # local time
 
     # Ensure all boss roles exist
     for guild in bot.guilds:
-        await bot.ensure_boss_roles(guild)
+        try:
+            await bot.ensure_boss_roles(guild)
+        except Exception as e:
+            print(f"⚠️ Failed to ensure boss roles for {guild.name}: {e}")
 
-    # Start both loops
-    if not refresh_boss_data.is_running():
-        await refresh_boss_data.start()
+    # Fetch next boss timers
+    try:
+        bot.boss_data = await fetch_bosses("NA")
+        now = datetime.now(timezone.utc)
+
+        if bot.boss_data:
+            # Create a dict to track next spawn per boss
+            next_spawns = {}
+            for boss in bot.boss_data:
+                try:
+                    spawn_utc = parse_time_str_to_utc(boss["time_str"])
+                    if spawn_utc < now:
+                        continue  # skip past spawns
+
+                    # Only keep the earliest spawn per boss
+                    if boss["name"] not in next_spawns or spawn_utc < next_spawns[boss["name"]]:
+                        next_spawns[boss["name"]] = spawn_utc
+                except Exception as e:
+                    print(f"⚠️ Failed to parse spawn for boss {boss.get('name')}: {e}")
+
+            if next_spawns:
+                print("🕒 Upcoming boss spawns:")
+                for name, spawn in sorted(next_spawns.items(), key=lambda x: x[1]):
+                    minutes_left = max(int((spawn - now).total_seconds() // 60), 0)
+                    hours, mins = divmod(minutes_left, 60)
+                    print(f" - {name}: spawns at {spawn} UTC (in {hours}h {mins}m)")
+            else:
+                print("⚠️ No upcoming boss spawns found.")
+        else:
+            print("⚠️ No boss data available.")
+
+    except Exception as e:
+        print("⚠️ Failed to fetch boss timers:", e)
+
+    # Start the polling loop only if it's not already running
     if not poll_and_alert.is_running():
         poll_and_alert.start()
+        print(f"⏱️ Started poll_and_alert loop (every {POLL_INTERVAL} seconds)")
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────
