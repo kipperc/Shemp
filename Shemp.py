@@ -76,30 +76,7 @@ class BossScraper:
 async def fetch_bosses(server="NA"):
     loop = asyncio.get_running_loop()
     scraper = BossScraper(server)
-    return await loop.run_in_executor(None, scraper.scrape)
-
-def parse_time_str_to_utc(time_str):
-    """
-    Convert MMOTimer 'Tue 18:15' to UTC datetime.
-    """
-    day_abbr, hm = time_str.split()
-    hour, minute = map(int, hm.split(":"))
-
-    # today in PST
-    now_pst = datetime.now(PST)
-    weekday_today = now_pst.weekday()
-    target_weekday = DAYS_MAP[day_abbr]
-
-    # days until target
-    delta_days = (target_weekday - weekday_today) % 7
-    target_date = now_pst + timedelta(days=delta_days)
-    target_dt = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    # if the time already passed today, move to next week
-    if target_dt < now_pst:
-        target_dt += timedelta(days=7)
-
-    return target_dt.astimezone(pytz.utc)
+    return await loop.run_in_executor(None, scraper.scrape
 
 
 # ─── Discord Bot ──────────────────────────────────────────────────────────
@@ -419,7 +396,6 @@ async def nextboss(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
 
-# ─── Event ───────────────────────────────────────────────────────────────
 # Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 PST = pytz.timezone("US/Pacific")
