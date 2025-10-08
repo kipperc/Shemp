@@ -76,7 +76,7 @@ class BossScraper:
 async def fetch_bosses(server="NA"):
     loop = asyncio.get_running_loop()
     scraper = BossScraper(server)
-    return await loop.run_in_executor(None, scraper.scrape
+    return await loop.run_in_executor(None, scraper.scrape)
 
 
 # ─── Discord Bot ──────────────────────────────────────────────────────────
@@ -197,10 +197,10 @@ async def poll_and_alert():
             bot.sent_alert_msg[guild_id] = new_msg.id
             bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
 
-@tasks.loop(hours=24)
-async def refresh_schedule():
-    # Re-fetch or reload boss data from file or URL
-    bot.bosses = load_boss_data()
+@bot.event
+async def on_guild_join(guild):
+    await bot.tree.sync(guild=discord.Object(id=guild.id))
+    print(f"✅ Synced commands for new guild: {guild.name}")
 
 
 # ─── Slash Commands ──────────────────────────────────────────────────────
@@ -395,7 +395,7 @@ async def nextboss(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
-
+        
 # Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 PST = pytz.timezone("US/Pacific")
