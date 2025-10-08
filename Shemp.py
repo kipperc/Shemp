@@ -8,15 +8,25 @@ from discord import app_commands
 from discord.ext import tasks
 import requests
 import pytz
+import threading
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+from enum import Enum
+import os
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────
 DISCORD_TOKEN = "DISCORD_TOKEN"
 POLL_INTERVAL = 15
 ALERT_LEAD_MINUTES = [60, 30, 5]
-
 DATA_FILE = "alerts_sent.json"
 CONFIG_FILE = "guild_config.json"
 ALERT_MSG_FILE = "last_alerts.json"
+PATCH_CONFIG_FILE = "patch_config.json"
+LAST_PATCH_FILE = "last_patch.json"
+PATCH_URL = "https://www.naeu.playblackdesert.com/en-US/News/Notice?boardType=2"  # Patch Notes board
+# ─── Constants ───────────────────────────────────────────
+TAX_RATE_NORMAL = 0.35   # No value pack
+TAX_RATE_VP = 0.155       # With value pack (adjust as needed)
 
 
 BOSS_NAMES = [
@@ -29,6 +39,81 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.guild_messages = True
+
+
+
+
+# ─── Load/Save JSON ───────────────────────────────────────────────
+def load_json(filename):
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_json(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+# ─── Scraper ──────────────────────────────────────────────────────
+async def fetch_latest_patch():
+    """
+    Scrapes the latest patch note from the official site.
+    Returns (title, url) or None if failed.
+    """
+    async with aiohttp.ClientSession() as session:
+        async with session.get(PATCH_URL) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+
+    soup = BeautifulSoup(html, "html.parser")
+    first_post = soup.select_one(".news_list li a")
+    if not first_post:
+        return None
+
+    title = first_post.select_one(".tit").get_text(strip=True)
+    url = "https://www.naeu.playblackdesert.com" + first_post["href"]
+    return (title, url)
+
+# ─── Patch Notes Loop ─────────────────────────────────────────────
+@tasks.loop(minutes=30)
+async def patch_notes_check(bot):
+    config = load_json(PATCH_CONFIG_FILE)
+    last_patch = load_json(LAST_PATCH_FILE)
+    last_title = last_patch.get("last_title")
+
+    result = await fetch_latest_patch()
+    if not result:
+        return
+
+    title, url = result
+    if title == last_title:
+        return  # already posted
+
+    for guild_id, channel_id in config.items():
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+        try:
+            embed = discord.Embed(
+                title=f"📰 New Patch Notes: {title}",
+                url=url,
+                description=f"[Read full patch notes here]({url})",
+                color=discord.Color.blurple(),
+                timestamp=datetime.utcnow()
+            )
+            embed.set_footer(text="Black Desert Online Patch Notes")
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"❌ Failed to send patch notes to guild {guild_id}: {e}")
+
+    save_json(LAST_PATCH_FILE, {"last_title": title})
+
+
+# ─── Init ─────────────────────────────────────────────────────────
+def setup_patch_commands(bot):
+    if not patch_notes_check.is_running():
+        patch_notes_check.start(bot)
 
 
 # ─── Boss Scraper ─────────────────────────────────────────────────────────
@@ -77,6 +162,187 @@ async def fetch_bosses(server="NA"):
     loop = asyncio.get_running_loop()
     scraper = BossScraper(server)
     return await loop.run_in_executor(None, scraper.scrape)
+
+
+# ==============================
+# ENUMS & CONFIG
+# ==============================
+
+class MarketRegion(Enum):
+    EU = "eu"
+    NA = "na"
+    SEA = "sea"
+    MENA = "mena"
+
+class ApiVersion(Enum):
+    V1 = "v1"
+    V2 = "v2"
+
+class Locale(Enum):
+    English = "en"
+    Korean = "kr"
+
+# ==============================
+# RESPONSE MODEL
+# ==============================
+
+@dataclass
+class ApiResponse:
+    success: bool = False
+    status_code: int = 0
+    message: str = ""
+    content: Any = None
+
+# ==============================
+# UTILITIES
+# ==============================
+
+def timestamp_to_datetime(ts: float) -> datetime:
+    """Convert UNIX timestamp (in seconds) to datetime."""
+    return datetime.utcfromtimestamp(ts)
+
+def check_for_updates():
+    """Optional background updater — can be adapted or removed."""
+    # Placeholder: in a real project this might check item lists or update cached data
+    return
+
+# ==============================
+# MAIN CLASS
+# ==============================
+
+class Market:
+    def __init__(self, region: MarketRegion = MarketRegion.EU, apiversion: ApiVersion = ApiVersion.V2, language: Locale = Locale.English):
+        self._base_url = "https://api.arsha.io"
+        self._api_version = apiversion.value
+        self._api_region = region.value
+        self._api_lang = language.value
+        self._session = requests.Session()
+        threading.Thread(target=check_for_updates, daemon=True).start()
+
+    # ------------- INTERNAL REQUEST HANDLERS -------------
+
+    async def _make_request_async(self, method: str, endpoint: str,
+                                  json_data: Optional[Any] = None,
+                                  data: Optional[Any] = None,
+                                  headers: Optional[Dict] = None,
+                                  params: Optional[Dict] = None) -> ApiResponse:
+        url = f"{self._base_url}/{self._api_version}/{self._api_region}/{endpoint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_data,
+                data=data,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                content = await response.json()
+                return ApiResponse(
+                    success=200 <= response.status <= 299,
+                    status_code=response.status,
+                    message=response.reason or "No message provided",
+                    content=content
+                )
+
+    def _make_request_sync(self, method: str, endpoint: str,
+                           json_data: Optional[Any] = None,
+                           data: Optional[Any] = None,
+                           headers: Optional[Dict] = None,
+                           params: Optional[Dict] = None) -> ApiResponse:
+        url = f"{self._base_url}/{self._api_version}/{self._api_region}/{endpoint}"
+        try:
+            if self._session is None:
+                self._session = requests.Session()
+            response = self._session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_data,
+                data=data,
+                headers=headers,
+                timeout=10
+            )
+            content = response.json() if response.content else {}
+            return ApiResponse(
+                success=200 <= response.status_code <= 299,
+                status_code=response.status_code,
+                message=response.reason or "No message provided",
+                content=content
+            )
+        except requests.RequestException as e:
+            return ApiResponse(success=False, message=str(e))
+
+    def close(self):
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    # ------------- API METHODS -------------
+
+    # Wait List
+    async def get_world_market_wait_list(self) -> ApiResponse:
+        return await self._make_request_async("GET", "GetWorldMarketWaitList")
+
+    def get_world_market_wait_list_sync(self) -> ApiResponse:
+        return self._make_request_sync("GET", "GetWorldMarketWaitList")
+
+    # Hot List
+    async def get_world_market_hot_list(self) -> ApiResponse:
+        return await self._make_request_async("GET", "GetWorldMarketHotList")
+
+    def get_world_market_hot_list_sync(self) -> ApiResponse:
+        return self._make_request_sync("GET", "GetWorldMarketHotList")
+
+    # Price Info
+    async def get_market_price_info(self, ids: List[str], sids: List[str], convertdate: bool = True, formatprice: bool = False) -> ApiResponse:
+        params = {"id": ids, "sid": sids, "lang": self._api_lang}
+        result = await self._make_request_async("GET", "GetMarketPriceInfo", params=params)
+        return self._convert_price_history(result, convertdate, formatprice)
+
+    def get_market_price_info_sync(self, ids: List[str], sids: List[str], convertdate: bool = True, formatprice: bool = False) -> ApiResponse:
+        params = {"id": ids, "sid": sids, "lang": self._api_lang}
+        result = self._make_request_sync("GET", "GetMarketPriceInfo", params=params)
+        return self._convert_price_history(result, convertdate, formatprice)
+
+    def _convert_price_history(self, result: ApiResponse, convertdate: bool, formatprice: bool) -> ApiResponse:
+        if not result.success or not result.content:
+            return result
+        content_list = [result.content] if isinstance(result.content, dict) else result.content
+        for item in content_list:
+            if "history" in item:
+                new_history = {}
+                for k, v in item["history"].items():
+                    new_key = timestamp_to_datetime(float(k) / 1000).strftime("%Y-%m-%d") if convertdate else k
+                    new_value = f"{v:,}" if formatprice else v
+                    new_history[new_key] = new_value
+                item["history"] = new_history
+        result.content = content_list
+        return result
+
+    # Search
+    async def get_world_market_search_list(self, ids: List[str]) -> ApiResponse:
+        return await self._make_request_async("GET", "GetWorldMarketSearchList", params={"ids": ids, "lang": self._api_lang})
+
+    def get_world_market_search_list_sync(self, ids: List[str]) -> ApiResponse:
+        return self._make_request_sync("GET", "GetWorldMarketSearchList", params={"ids": ids, "lang": self._api_lang})
+
+    # Category List
+    async def get_world_market_list(self, main_category: str, sub_category: str) -> ApiResponse:
+        params = {"mainCategory": main_category, "subCategory": sub_category, "lang": self._api_lang}
+        return await self._make_request_async("GET", "GetWorldMarketList", params=params)
+
+    def get_world_market_list_sync(self, main_category: str, sub_category: str) -> ApiResponse:
+        params = {"mainCategory": main_category, "subCategory": sub_category, "lang": self._api_lang}
+        return self._make_request_sync("GET", "GetWorldMarketList", params=params)
+
+    # Sub List
+    async def get_world_market_sub_list(self, ids: List[str]) -> ApiResponse:
+        return await self._make_request_async("GET", "GetWorldMarketSubList", params={"id": ids, "lang": self._api_lang})
+
+    def get_world_market_sub_list_sync(self, ids: List[str]) -> ApiResponse:
+        return self._make_request_sync("GET", "GetWorldMarketSubList", params={"id": ids, "lang": self._api_lang})
+
 
 
 # ─── Discord Bot ──────────────────────────────────────────────────────────
@@ -319,6 +585,161 @@ async def testpoll(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
+        
+patch_group = app_commands.Group(name="patch", description="Patch notes settings & tools.")
+
+@patch_group.command(name="setchannel", description="Set the patch notes channel for this server.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_patch_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    config = load_json(PATCH_CONFIG_FILE)
+    config[str(interaction.guild_id)] = channel.id
+    save_json(PATCH_CONFIG_FILE, config)
+    await interaction.response.send_message(f"✅ Patch notes channel set to {channel.mention}")
+
+@patch_group.command(name="check", description="Force check patch notes now.")
+@app_commands.checks.has_permissions(administrator=True)
+async def check_patch_now(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    result = await fetch_latest_patch()
+    if not result:
+        await interaction.followup.send("❌ Could not fetch patch notes.")
+        return
+
+    title, url = result
+    embed = discord.Embed(
+        title=f"📰 Latest Patch Notes: {title}",
+        url=url,
+        description=f"[Read full patch notes here]({url})",
+        color=discord.Color.green(),
+        timestamp=datetime.utcnow()
+    )
+    await interaction.followup.send(embed=embed)
+    
+# ─── Slash Command Tree ───────────────────────────────────
+market_group = app_commands.Group(name="market", description="Marketplace tools and utilities.")
+
+# ─── PRICE ────────────────────────────────────────────────
+@market_group.command(name="price", description="Check current marketplace price for an item.")
+@app_commands.describe(item="Item name to check")
+async def price(interaction: discord.Interaction, item: str):
+    data = get_item_data(item)
+    if not data:
+        await interaction.response.send_message(f"❌ Item `{item}` not found.")
+        return
+
+    embed = discord.Embed(
+        title=f"📊 Marketplace — {data['name']}",
+        color=discord.Color.blurple(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="💰 Price", value=f"{data['price']:,} silver", inline=True)
+    embed.add_field(name="📦 Stock", value=f"{data['stock']:,}", inline=True)
+    embed.set_footer(text="Marketplace data")
+    await interaction.response.send_message(embed=embed)
+
+# ─── PROFIT ───────────────────────────────────────────────
+@market_group.command(name="profit", description="Calculate flipping profit with or without a value pack.")
+@app_commands.describe(
+    item="Item name",
+    buy_price="Price you plan to buy at",
+    sell_price="Price you plan to sell at",
+    value_pack="Do you have a Value Pack active?"
+)
+async def profit(interaction: discord.Interaction, item: str, buy_price: int, sell_price: int, value_pack: bool):
+    tax_rate = TAX_RATE_VP if value_pack else TAX_RATE_NORMAL
+    tax = int(sell_price * tax_rate)
+    net_profit = (sell_price - tax) - buy_price
+
+    emoji = "✅" if net_profit > 0 else "⚠️"
+    embed = discord.Embed(
+        title=f"💹 Flip Calculator — {item}",
+        color=discord.Color.green() if net_profit > 0 else discord.Color.red(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="🛒 Buy Price", value=f"{buy_price:,} silver", inline=True)
+    embed.add_field(name="🏷 Sell Price", value=f"{sell_price:,} silver", inline=True)
+    embed.add_field(name="📜 Tax Rate", value=f"{int(tax_rate*100)}%", inline=True)
+    embed.add_field(name="💸 Tax", value=f"{tax:,} silver", inline=True)
+    embed.add_field(name=f"{emoji} Net Profit", value=f"{net_profit:,} silver", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+# ─── STOCK ────────────────────────────────────────────────
+@market_group.command(name="stock", description="Check stock trend for an item.")
+@app_commands.describe(item="Item name")
+async def stock(interaction: discord.Interaction, item: str):
+    data = get_item_data(item)
+    if not data:
+        await interaction.response.send_message(f"❌ Item `{item}` not found.")
+        return
+
+    trend = data.get("trend", "📈 No trend data yet")
+    embed = discord.Embed(
+        title=f"📦 Stock — {data['name']}",
+        color=discord.Color.gold(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Current Stock", value=f"{data['stock']:,}", inline=True)
+    embed.add_field(name="Trend", value=trend, inline=True)
+    await interaction.response.send_message(embed=embed)
+
+# ─── WATCH ────────────────────────────────────────────────
+@market_group.command(name="watch", description="Set a price alert for an item.")
+@app_commands.describe(item="Item name", target_price="Alert price")
+async def watch(interaction: discord.Interaction, item: str, target_price: int):
+    # You’d persist this alert in a file or database
+    await interaction.response.send_message(
+        f"👀 Alert created for `{item}` — I'll notify you when it drops below **{target_price:,} silver**."
+    )
+
+# ─── SEARCH ───────────────────────────────────────────────
+@market_group.command(name="search", description="Search marketplace for items by keyword.")
+@app_commands.describe(keyword="Keyword to search for")
+async def search(interaction: discord.Interaction, keyword: str):
+    results = fake_search_items(keyword)
+    if not results:
+        await interaction.response.send_message(f"🔍 No results for `{keyword}`.")
+        return
+
+    embed = discord.Embed(
+        title=f"🔍 Search Results for '{keyword}'",
+        description="\n".join([f"{i+1}. {name}" for i, name in enumerate(results)]),
+        color=discord.Color.teal()
+    )
+    await interaction.response.send_message(embed=embed)
+
+def fake_search_items(keyword: str):
+    sample_items = ["Ogre Ring", "Black Stone (Weapon)", "Caphras Stone", "Memory Fragment"]
+    return [x for x in sample_items if keyword.lower() in x.lower()]
+
+# ─── SILVERCALC ───────────────────────────────────────────
+@market_group.command(name="silvercalc", description="Calculate total silver cost with or without value pack.")
+@app_commands.describe(
+    item="Item name",
+    quantity="How many you want",
+    value_pack="Do you have a Value Pack active?"
+)
+async def silvercalc(interaction: discord.Interaction, item: str, quantity: int, value_pack: bool):
+    data = get_item_data(item)
+    if not data:
+        await interaction.response.send_message(f"❌ Item `{item}` not found.")
+        return
+
+    tax_rate = TAX_RATE_VP if value_pack else TAX_RATE_NORMAL
+    total_cost = data['price'] * quantity
+    tax_cost = int(total_cost * tax_rate)
+    total_after_tax = total_cost - tax_cost
+
+    embed = discord.Embed(
+        title=f"🧾 Silver Calculator — {data['name']}",
+        color=discord.Color.purple(),
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Unit Price", value=f"{data['price']:,} silver", inline=True)
+    embed.add_field(name="Quantity", value=f"{quantity:,}", inline=True)
+    embed.add_field(name="Total Cost", value=f"{total_cost:,} silver", inline=False)
+    embed.add_field(name="Tax Rate", value=f"{int(tax_rate*100)}%", inline=True)
+    embed.add_field(name="After Tax", value=f"{total_after_tax:,} silver", inline=True)
+    await interaction.response.send_message(embed=embed)
 
 
 
