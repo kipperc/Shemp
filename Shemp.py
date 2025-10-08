@@ -18,6 +18,7 @@ import os
 DISCORD_TOKEN = "DISCORD_TOKEN"
 POLL_INTERVAL = 15
 ALERT_LEAD_MINUTES = [60, 30, 5]
+
 DATA_FILE = "alerts_sent.json"
 CONFIG_FILE = "guild_config.json"
 ALERT_MSG_FILE = "last_alerts.json"
@@ -197,9 +198,11 @@ class ApiResponse:
 # UTILITIES
 # ==============================
 
+
 def timestamp_to_datetime(ts: float) -> datetime:
-    """Convert UNIX timestamp (in seconds) to datetime."""
-    return datetime.utcfromtimestamp(ts)
+    """Convert UNIX timestamp (in seconds) to a timezone-aware UTC datetime."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
 
 def check_for_updates():
     """Optional background updater — can be adapted or removed."""
@@ -209,6 +212,67 @@ def check_for_updates():
 # ==============================
 # MAIN CLASS
 # ==============================
+
+# ─── Discord Bot ──────────────────────────────────────────────────────────
+class BossBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.sent_alerts = self._load_json(DATA_FILE)
+        self.guild_config = self._load_json(CONFIG_FILE)
+        self.boss_roles = {}
+        self.sent_alert_msg = self._load_json(ALERT_MSG_FILE)
+
+    def _load_json(self, path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def _save_json(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    async def ensure_boss_roles(self, guild: discord.Guild):
+        existing = {r.name: r for r in guild.roles}
+        for boss in BOSS_NAMES:
+            if boss not in existing:
+                role = await guild.create_role(name=boss, mentionable=True, reason="Boss alert role")
+                print(f"Created role: {boss}")
+            else:
+                role = existing[boss]
+            if not role.mentionable:
+                await role.edit(mentionable=True)
+            self.boss_roles[boss] = role
+        print(f"[{guild.name}] Boss roles ready.")
+
+    def cleanup_old_alerts(self, hours=1):
+        now_ts = datetime.now(timezone.utc).timestamp()
+        cutoff = now_ts - hours * 3600
+        to_delete = [aid for aid, ts in self.sent_alerts.items() if ts < cutoff]
+        for aid in to_delete:
+            del self.sent_alerts[aid]
+        if to_delete:
+            self._save_json(DATA_FILE, self.sent_alerts)
+            print(f"Cleaned up {len(to_delete)} old alerts.")
+            
+
+        
+    async def ensure_boss_roles_on_ready(self):
+        """Ensure all boss roles exist for every guild."""
+        for guild in self.guilds:
+            try:
+                await self.ensure_boss_roles(guild)
+                print(f"[⚙️] Verified boss roles in {guild.name}")
+            except Exception as e:
+                print(f"[❌] Failed to ensure roles in {guild.name}: {e}")
+
+
+
+# Instantiate the bot
+bot = BossBot()
+
 
 class Market:
     def __init__(self, region: MarketRegion = MarketRegion.EU, apiversion: ApiVersion = ApiVersion.V2, language: Locale = Locale.English):
@@ -342,71 +406,6 @@ class Market:
 
     def get_world_market_sub_list_sync(self, ids: List[str]) -> ApiResponse:
         return self._make_request_sync("GET", "GetWorldMarketSubList", params={"id": ids, "lang": self._api_lang})
-
-
-
-# ─── Discord Bot ──────────────────────────────────────────────────────────
-class BossBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.sent_alerts = self._load_json(DATA_FILE)
-        self.guild_config = self._load_json(CONFIG_FILE)
-        self.boss_roles = {}
-        self.sent_alert_msg = self._load_json(ALERT_MSG_FILE)
-
-
-    async def setup_hook(self):
-        # Sync all guild commands first (instant)
-        for guild in self.guilds:
-            try:
-                await self.tree.sync(guild=discord.Object(id=guild.id))
-                print(f"✅ Synced commands to guild: {guild.name} ({guild.id})")
-            except Exception as e:
-                print(f"⚠️ Failed to sync commands for guild {guild.name}: {e}")
-
-        # Optionally, sync global commands (propagates slowly)
-        try:
-            await self.tree.sync()
-            print("🌐 Synced global commands")
-        except Exception as e:
-            print(f"⚠️ Failed to sync global commands: {e}")
-    def _load_json(self, path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {}
-
-    def _save_json(self, path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-
-    async def ensure_boss_roles(self, guild: discord.Guild):
-        existing = {r.name: r for r in guild.roles}
-        for boss in BOSS_NAMES:
-            if boss not in existing:
-                role = await guild.create_role(name=boss, mentionable=True, reason="Boss alert role")
-                print(f"Created role: {boss}")
-            else:
-                role = existing[boss]
-            if not role.mentionable:
-                await role.edit(mentionable=True)
-            self.boss_roles[boss] = role
-        print(f"[{guild.name}] Boss roles ready.")
-
-    def cleanup_old_alerts(self, hours=1):
-        now_ts = datetime.now(timezone.utc).timestamp()
-        cutoff = now_ts - hours * 3600
-        to_delete = [aid for aid, ts in self.sent_alerts.items() if ts < cutoff]
-        for aid in to_delete:
-            del self.sent_alerts[aid]
-        if to_delete:
-            self._save_json(DATA_FILE, self.sent_alerts)
-            print(f"Cleaned up {len(to_delete)} old alerts.")
-
-bot = BossBot()
 
 
 # ─── Slash Commands ──────────────────────────────────────────────────────
@@ -741,8 +740,6 @@ async def silvercalc(interaction: discord.Interaction, item: str, quantity: int,
     embed.add_field(name="After Tax", value=f"{total_after_tax:,} silver", inline=True)
     await interaction.response.send_message(embed=embed)
 
-
-
         
 # Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
@@ -840,8 +837,6 @@ async def poll_and_alert():
                 bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
             except Exception as e:
                 print(f"❌ Failed to send alert in guild {guild_id}: {e}")
-
-
 
 # ─── On Ready ─────────────────────────────────────────────────────────
 @bot.event
