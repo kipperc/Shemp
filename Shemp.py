@@ -257,7 +257,6 @@ class BossBot(discord.Client):
             self._save_json(DATA_FILE, self.sent_alerts)
             print(f"Cleaned up {len(to_delete)} old alerts.")
             
-
         
     async def ensure_boss_roles_on_ready(self):
         """Ensure all boss roles exist for every guild."""
@@ -847,6 +846,9 @@ async def on_ready():
 
     # Ensure all boss roles exist
     for guild in bot.guilds:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"[⚡] Synced commands to {guild.name}")
         try:
             await bot.ensure_boss_roles(guild)
         except Exception as e:
