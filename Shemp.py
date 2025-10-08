@@ -142,66 +142,6 @@ class BossBot(discord.Client):
 
 bot = BossBot()
 
-# ─── Polling + Alerts ────────────────────────────────────────────────────
-@tasks.loop(seconds=POLL_INTERVAL)
-async def poll_and_alert():
-    bot.cleanup_old_alerts(hours=1)
-
-    try:
-        bosses = await fetch_bosses("NA")  # NA / EU / SEA
-    except Exception as e:
-        print("Failed to fetch boss timers:", e)
-        return
-
-    now = datetime.now(timezone.utc)
-
-    for guild_id, config in bot.guild_config.items():
-        channel_id = config.get("channel_id")
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            continue
-
-        messages_to_send = []
-
-        for boss in bosses:
-            name = boss["name"]
-            spawn = parse_time_str_to_utc(boss["time_str"])
-            minutes_until = int((spawn - now).total_seconds() // 60)
-
-            if minutes_until in ALERT_LEAD_MINUTES:
-                alert_id = f"{guild_id}_{name}_{minutes_until}"
-                if alert_id in bot.sent_alerts:
-                    continue  # skip duplicate
-
-                role = bot.boss_roles.get(name)
-                mention = role.mention if role else name
-                messages_to_send.append(f"⚠️ {mention} spawns in {minutes_until} minutes!")
-
-                # Mark alert as sent
-                bot.sent_alerts[alert_id] = now.timestamp()
-
-        if messages_to_send:
-            bot._save_json(DATA_FILE, bot.sent_alerts)
-
-            # Delete previous alert if it exists
-            last_msg_id = bot.sent_alert_msg.get(guild_id)
-            if last_msg_id:
-                try:
-                    last_msg = await channel.fetch_message(last_msg_id)
-                    await last_msg.delete()
-                except Exception:
-                    pass  # message may have been deleted manually
-
-            # Send new alert and store its message ID
-            new_msg = await channel.send("\n".join(messages_to_send))
-            bot.sent_alert_msg[guild_id] = new_msg.id
-            bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
-
-@bot.event
-async def on_guild_join(guild):
-    await bot.tree.sync(guild=discord.Object(id=guild.id))
-    print(f"✅ Synced commands for new guild: {guild.name}")
-
 
 # ─── Slash Commands ──────────────────────────────────────────────────────
 
@@ -320,81 +260,7 @@ async def createroles(interaction: discord.Interaction):
 
     await interaction.followup.send(msg, ephemeral=True)
 
-@bot.tree.command(name="testalert", description="Send a test alert for a boss.")
-@discord.app_commands.describe(boss="Name of the boss to test", lead="Lead time in minutes (0, 5, 30)")
-async def testalert(interaction: discord.Interaction, boss: str, lead: int):
-    await interaction.response.defer(ephemeral=True)
 
-    boss = boss.title()
-    if boss not in BOSS_NAMES:
-        await interaction.followup.send("Invalid boss name.", ephemeral=True)
-        return
-    if lead not in [0, 5, 30]:
-        await interaction.followup.send("Lead time must be 0, 5, or 30.", ephemeral=True)
-        return
-
-    # Get the alert channel for this guild
-    guild_id = str(interaction.guild_id)
-    channel_id = bot.guild_config.get(guild_id, {}).get("channel_id")
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        await interaction.followup.send("Alert channel not set! Use /setupalerts first.", ephemeral=True)
-        return
-
-    # Create the message
-    role = bot.boss_roles.get(boss)
-    mention = role.mention if role else f"**{boss}**"
-    if lead == 30:
-        message = f"⚠️ {mention} spawns in 30 minutes! [TEST]"
-    elif lead == 5:
-        message = f"🔥 {mention} spawns in 5 minutes! [TEST]"
-    else:
-        message = f"🚨 {mention} has spawned! [TEST]"
-
-    await channel.send(message)
-    await interaction.followup.send(f"Test alert sent for {boss} ({lead} min).", ephemeral=True)
-
-
-@bot.tree.command(
-    name="nextboss",
-    description="Show the next boss(es) that will spawn."
-)
-async def nextboss(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        bosses = await fetch_bosses("NA")  # adjust server if needed
-        now = datetime.now(timezone.utc)
-
-        if not bosses:
-            await interaction.followup.send("⚠️ No boss data available.", ephemeral=True)
-            return
-
-        # Filter out past spawns
-        upcoming = []
-        for boss in bosses:
-            spawn_utc = parse_time_str_to_utc(boss["time_str"])
-            if spawn_utc >= now:
-                upcoming.append((boss["name"], spawn_utc))
-
-        if not upcoming:
-            await interaction.followup.send("⚠️ No upcoming boss spawns found.", ephemeral=True)
-            return
-
-        # Find the earliest spawn time
-        next_time = min(upcoming, key=lambda x: x[1])[1]
-
-        # Collect all bosses spawning at that time
-        next_bosses = [name for name, spawn in upcoming if spawn == next_time]
-
-        minutes_left = max(int((next_time - now).total_seconds() // 60), 0)
-        message = f"⚠️ Next boss spawn in {minutes_left} minutes at {next_time.strftime('%Y-%m-%d %H:%M UTC')}:\n"
-        message += "\n".join(f"**{boss}**" for boss in next_bosses)
-
-        await interaction.followup.send(message, ephemeral=True)
-
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
         
 # Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
@@ -422,48 +288,89 @@ def parse_time_str_to_utc(time_str):
 
     return target_dt.astimezone(pytz.utc)
 
+# ─── Refresh Boss Data Loop ─────────────────────────────────────────────
+@tasks.loop(hours=1)
+async def refresh_boss_data():
+    try:
+        bot.boss_data = await fetch_bosses("NA")  # fetch fresh data
+        now = datetime.now(timezone.utc)
+        if bot.boss_data:
+            print(f"✅ Refreshed boss data at {now}")
+        else:
+            print(f"⚠️ No boss data available at {now}")
+    except Exception as e:
+        print(f"❌ Failed to refresh boss data: {e}")
 
-# ─── Event ───────────────────────────────────────────────────────────────
+
+# ─── Poll and Alert Loop ───────────────────────────────────────────────
+@tasks.loop(seconds=POLL_INTERVAL)
+async def poll_and_alert():
+    await bot.wait_until_ready()
+    bot.cleanup_old_alerts(hours=1)
+
+    bosses = getattr(bot, "boss_data", None)
+    if not bosses:
+        return  # no data yet
+
+    now = datetime.now(timezone.utc)
+
+    for guild_id, config in bot.guild_config.items():
+        channel_id = config.get("channel_id")
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+
+        messages_to_send = []
+
+        for boss in bosses:
+            name = boss["name"]
+            spawn = parse_time_str_to_utc(boss["time_str"])
+            minutes_until = int((spawn - now).total_seconds() // 60)
+
+            if minutes_until in ALERT_LEAD_MINUTES:
+                alert_id = f"{guild_id}_{name}_{minutes_until}"
+                if alert_id in bot.sent_alerts:
+                    continue  # skip duplicate
+
+                role = bot.boss_roles.get(name)
+                mention = role.mention if role else name
+                messages_to_send.append(f"⚠️ {mention} spawns in {minutes_until} minutes!")
+
+                # Mark alert as sent
+                bot.sent_alerts[alert_id] = now.timestamp()
+
+        if messages_to_send:
+            bot._save_json(DATA_FILE, bot.sent_alerts)
+
+            # Delete previous alert if it exists
+            last_msg_id = bot.sent_alert_msg.get(guild_id)
+            if last_msg_id:
+                try:
+                    last_msg = await channel.fetch_message(last_msg_id)
+                    await last_msg.delete()
+                except Exception:
+                    pass  # message may have been deleted manually
+
+            # Send new alert and store its message ID
+            new_msg = await channel.send("\n".join(messages_to_send))
+            bot.sent_alert_msg[guild_id] = new_msg.id
+            bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
+
+
+# ─── On Ready ─────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     print("UTC now:", datetime.now(timezone.utc))
-    print("Local now:", datetime.now())  # local time
+    print("Local now:", datetime.now())
 
     # Ensure all boss roles exist
     for guild in bot.guilds:
         await bot.ensure_boss_roles(guild)
 
-    # Fetch next boss timers
-    try:
-        bosses = await fetch_bosses("NA")  # NA / EU / SEA
-        now = datetime.now(timezone.utc)
-
-        if bosses:
-            # Create a dict to track next spawn per boss
-            next_spawns = {}
-            for boss in bosses:
-                spawn_utc = parse_time_str_to_utc(boss["time_str"])
-                if spawn_utc < now:
-                    continue  # skip past spawns
-
-                # Only keep the earliest spawn per boss
-                if boss["name"] not in next_spawns or spawn_utc < next_spawns[boss["name"]]:
-                    next_spawns[boss["name"]] = spawn_utc
-
-            if next_spawns:
-                print("🕒 Next boss timers:")
-                for name, spawn in sorted(next_spawns.items(), key=lambda x: x[1]):
-                    minutes_left = max(int((spawn - now).total_seconds() // 60), 0)
-                    print(f" - {name}: spawns at {spawn} ({minutes_left} min left)")
-            else:
-                print("⚠️ No upcoming boss spawns found.")
-        else:
-            print("⚠️ No boss data available.")
-    except Exception as e:
-        print("⚠️ Failed to fetch boss timers:", e)
-
-    # Start the polling loop only if it's not already running
+    # Start both loops
+    if not refresh_boss_data.is_running():
+        await refresh_boss_data.start()
     if not poll_and_alert.is_running():
         poll_and_alert.start()
 
