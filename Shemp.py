@@ -408,6 +408,9 @@ class Market:
 
 
 # ─── Slash Commands ──────────────────────────────────────────────────────
+market_group = app_commands.Group(name="market", description="Marketplace tools and utilities.")
+patch_group = app_commands.Group(name="patch", description="Patch notes settings & tools.")
+
 
 @bot.tree.command(name="setupalerts", description="Set the channel for boss alerts (admin only).")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
@@ -583,8 +586,7 @@ async def testpoll(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
-        
-patch_group = app_commands.Group(name="patch", description="Patch notes settings & tools.")
+
 
 @patch_group.command(name="setchannel", description="Set the patch notes channel for this server.")
 @app_commands.checks.has_permissions(administrator=True)
@@ -613,9 +615,6 @@ async def check_patch_now(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed)
     
-# ─── Slash Command Tree ───────────────────────────────────
-market_group = app_commands.Group(name="market", description="Marketplace tools and utilities.")
-
 # ─── PRICE ────────────────────────────────────────────────
 @market_group.command(name="price", description="Check current marketplace price for an item.")
 @app_commands.describe(item="Item name to check")
@@ -739,7 +738,8 @@ async def silvercalc(interaction: discord.Interaction, item: str, quantity: int,
     embed.add_field(name="After Tax", value=f"{total_after_tax:,} silver", inline=True)
     await interaction.response.send_message(embed=embed)
 
-        
+
+
 # Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 PST = pytz.timezone("US/Pacific")
@@ -843,10 +843,11 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     print("UTC now:", datetime.now(timezone.utc))
     print("Local now:", datetime.now())  # local time
+    bot.tree.add_command(patch_group)
+    bot.tree.add_command(market_group)
 
     # Ensure all boss roles exist
     for guild in bot.guilds:
-        bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         print(f"[⚡] Synced commands to {guild.name}")
         try:
