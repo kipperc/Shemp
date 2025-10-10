@@ -5,7 +5,7 @@ import asyncio
 from bs4 import BeautifulSoup
 import discord
 from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 import requests
 import pytz
 import threading
@@ -14,33 +14,39 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 import os
 
+# ──────── Intents ─────────────────────────────────────────────────────────────────
+
+intents = discord.Intents.default()
+intents.message_content = True  # 👈 Enable message content intent
+intents.guilds = True
+intents.members = True
+intents.guild_messages = True
+
+
+# ─── Initialize Bot ─────────────────────────────
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────
+
 DISCORD_TOKEN = "DISCORD_TOKEN"
 POLL_INTERVAL = 15
 ALERT_LEAD_MINUTES = [60, 30, 5]
-
 DATA_FILE = "alerts_sent.json"
 CONFIG_FILE = "guild_config.json"
 ALERT_MSG_FILE = "last_alerts.json"
 PATCH_CONFIG_FILE = "patch_config.json"
 LAST_PATCH_FILE = "last_patch.json"
+MARKET_FILE = "market_data.json"
 PATCH_URL = "https://www.naeu.playblackdesert.com/en-US/News/Notice?boardType=2"  # Patch Notes board
-# ─── Constants ───────────────────────────────────────────
-TAX_RATE_NORMAL = 0.35   # No value pack
-TAX_RATE_VP = 0.155       # With value pack (adjust as needed)
 
+# ─── Constants ───────────────────────────────────────────
 
 BOSS_NAMES = [
     "Garmoth", "Karanda", "Kutum", "Kzarka", "Muraka",
     "Nouver", "Offin", "Quint", "Vell", "Golden Pig King",
     "Bulgasal", "Uturi", "Sangoon",
 ]
-# ─────────────────────────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True
-intents.guild_messages = True
-
 
 
 
@@ -55,7 +61,16 @@ def save_json(filename, data):
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+
+# Attach the data to bot object
+bot.sent_alerts = load_json(DATA_FILE)
+bot.guild_config = load_json(CONFIG_FILE)
+bot.sent_alert_msg = load_json(ALERT_MSG_FILE)
+bot.boss_roles = {}
+
+
 # ─── Scraper ──────────────────────────────────────────────────────
+
 async def fetch_latest_patch():
     """
     Scrapes the latest patch note from the official site.
@@ -64,20 +79,73 @@ async def fetch_latest_patch():
     async with aiohttp.ClientSession() as session:
         async with session.get(PATCH_URL) as resp:
             if resp.status != 200:
+                print(f"❌ Failed to fetch patch notes: status {resp.status}")
                 return None
             html = await resp.text()
 
     soup = BeautifulSoup(html, "html.parser")
-    first_post = soup.select_one(".news_list li a")
+
+    # Look inside the actual patch notes list
+    first_post = soup.select_one("ul.thumb_nail_list li a")
     if not first_post:
+        print("❌ No patch notes found in .thumb_nail_list — structure may have changed.")
         return None
 
-    title = first_post.select_one(".tit").get_text(strip=True)
-    url = "https://www.naeu.playblackdesert.com" + first_post["href"]
-    return (title, url)
+    # Extract title text
+    title_elem = first_post.select_one(".title .line_clamp")
+    if not title_elem:
+        print("❌ Could not find title element.")
+        return None
+    title = title_elem.get_text(strip=True)
+
+    # Extract URL
+    href = first_post.get("href")
+    if not href:
+        print("❌ No href found for patch notes.")
+        return None
+    if not href.startswith("http"):
+        href = "https://www.naeu.playblackdesert.com" + href
+
+    print(f"✅ Found latest patch: {title} -> {href}")
+    return (title, href)
+
+
+# ─── Boss Roles Enforcer ───────────────────────────────────────────────
+
+async def ensure_boss_roles(guild: discord.Guild):
+    """
+    Make sure all boss roles exist in this guild and are mentionable.
+    Stores roles in bot.boss_roles[guild.id][boss_name].
+    """
+    if not hasattr(bot, "boss_roles"):
+        bot.boss_roles = {}
+
+    if guild.id not in bot.boss_roles:
+        bot.boss_roles[guild.id] = {}
+
+    existing = {r.name: r for r in guild.roles}
+
+    for boss in BOSS_NAMES:
+        if boss in existing:
+            role = existing[boss]
+            # Ensure mentionable
+            if not role.mentionable:
+                await role.edit(mentionable=True)
+        else:
+            role = await guild.create_role(
+                name=boss,
+                mentionable=True,
+                reason="Boss alert role"
+            )
+            print(f"[{guild.name}] Created role: {boss}")
+
+        bot.boss_roles[guild.id][boss] = role
+
+    print(f"[{guild.name}] Boss roles ready.")
+
 
 # ─── Patch Notes Loop ─────────────────────────────────────────────
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=180)
 async def patch_notes_check(bot):
     config = load_json(PATCH_CONFIG_FILE)
     last_patch = load_json(LAST_PATCH_FILE)
@@ -109,12 +177,8 @@ async def patch_notes_check(bot):
             print(f"❌ Failed to send patch notes to guild {guild_id}: {e}")
 
     save_json(LAST_PATCH_FILE, {"last_title": title})
+    
 
-
-# ─── Init ─────────────────────────────────────────────────────────
-def setup_patch_commands(bot):
-    if not patch_notes_check.is_running():
-        patch_notes_check.start(bot)
 
 
 # ─── Boss Scraper ─────────────────────────────────────────────────────────
@@ -165,318 +229,99 @@ async def fetch_bosses(server="NA"):
     return await loop.run_in_executor(None, scraper.scrape)
 
 
-# ==============================
-# ENUMS & CONFIG
-# ==============================
-
-class MarketRegion(Enum):
-    EU = "eu"
-    NA = "na"
-    SEA = "sea"
-    MENA = "mena"
-
-class ApiVersion(Enum):
-    V1 = "v1"
-    V2 = "v2"
-
-class Locale(Enum):
-    English = "en"
-    Korean = "kr"
-
-# ==============================
-# RESPONSE MODEL
-# ==============================
-
-@dataclass
-class ApiResponse:
-    success: bool = False
-    status_code: int = 0
-    message: str = ""
-    content: Any = None
-
-# ==============================
-# UTILITIES
-# ==============================
-
 
 def timestamp_to_datetime(ts: float) -> datetime:
     """Convert UNIX timestamp (in seconds) to a timezone-aware UTC datetime."""
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def check_for_updates():
-    """Optional background updater — can be adapted or removed."""
-    # Placeholder: in a real project this might check item lists or update cached data
-    return
 
-# ==============================
-# MAIN CLASS
-# ==============================
-
-# ─── Discord Bot ──────────────────────────────────────────────────────────
-class BossBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self.sent_alerts = self._load_json(DATA_FILE)
-        self.guild_config = self._load_json(CONFIG_FILE)
-        self.boss_roles = {}
-        self.sent_alert_msg = self._load_json(ALERT_MSG_FILE)
-
-    def _load_json(self, path):
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {}
-
-    def _save_json(self, path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    async def ensure_boss_roles(self, guild: discord.Guild):
-        existing = {r.name: r for r in guild.roles}
-        for boss in BOSS_NAMES:
-            if boss not in existing:
-                role = await guild.create_role(name=boss, mentionable=True, reason="Boss alert role")
-                print(f"Created role: {boss}")
-            else:
-                role = existing[boss]
-            if not role.mentionable:
-                await role.edit(mentionable=True)
-            self.boss_roles[boss] = role
-        print(f"[{guild.name}] Boss roles ready.")
-
-    def cleanup_old_alerts(self, hours=1):
-        now_ts = datetime.now(timezone.utc).timestamp()
-        cutoff = now_ts - hours * 3600
-        to_delete = [aid for aid, ts in self.sent_alerts.items() if ts < cutoff]
-        for aid in to_delete:
-            del self.sent_alerts[aid]
-        if to_delete:
-            self._save_json(DATA_FILE, self.sent_alerts)
-            print(f"Cleaned up {len(to_delete)} old alerts.")
-            
-        
-    async def ensure_boss_roles_on_ready(self):
-        """Ensure all boss roles exist for every guild."""
-        for guild in self.guilds:
-            try:
-                await self.ensure_boss_roles(guild)
-                print(f"[⚙️] Verified boss roles in {guild.name}")
-            except Exception as e:
-                print(f"[❌] Failed to ensure roles in {guild.name}: {e}")
-
-
-
-# Instantiate the bot
-bot = BossBot()
-
-
-class Market:
-    def __init__(self, region: MarketRegion = MarketRegion.EU, apiversion: ApiVersion = ApiVersion.V2, language: Locale = Locale.English):
-        self._base_url = "https://api.arsha.io"
-        self._api_version = apiversion.value
-        self._api_region = region.value
-        self._api_lang = language.value
-        self._session = requests.Session()
-        threading.Thread(target=check_for_updates, daemon=True).start()
-
-    # ------------- INTERNAL REQUEST HANDLERS -------------
-
-    async def _make_request_async(self, method: str, endpoint: str,
-                                  json_data: Optional[Any] = None,
-                                  data: Optional[Any] = None,
-                                  headers: Optional[Dict] = None,
-                                  params: Optional[Dict] = None) -> ApiResponse:
-        url = f"{self._base_url}/{self._api_version}/{self._api_region}/{endpoint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                data=data,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                content = await response.json()
-                return ApiResponse(
-                    success=200 <= response.status <= 299,
-                    status_code=response.status,
-                    message=response.reason or "No message provided",
-                    content=content
-                )
-
-    def _make_request_sync(self, method: str, endpoint: str,
-                           json_data: Optional[Any] = None,
-                           data: Optional[Any] = None,
-                           headers: Optional[Dict] = None,
-                           params: Optional[Dict] = None) -> ApiResponse:
-        url = f"{self._base_url}/{self._api_version}/{self._api_region}/{endpoint}"
-        try:
-            if self._session is None:
-                self._session = requests.Session()
-            response = self._session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                data=data,
-                headers=headers,
-                timeout=10
-            )
-            content = response.json() if response.content else {}
-            return ApiResponse(
-                success=200 <= response.status_code <= 299,
-                status_code=response.status_code,
-                message=response.reason or "No message provided",
-                content=content
-            )
-        except requests.RequestException as e:
-            return ApiResponse(success=False, message=str(e))
-
-    def close(self):
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-
-    # ------------- API METHODS -------------
-
-    # Wait List
-    async def get_world_market_wait_list(self) -> ApiResponse:
-        return await self._make_request_async("GET", "GetWorldMarketWaitList")
-
-    def get_world_market_wait_list_sync(self) -> ApiResponse:
-        return self._make_request_sync("GET", "GetWorldMarketWaitList")
-
-    # Hot List
-    async def get_world_market_hot_list(self) -> ApiResponse:
-        return await self._make_request_async("GET", "GetWorldMarketHotList")
-
-    def get_world_market_hot_list_sync(self) -> ApiResponse:
-        return self._make_request_sync("GET", "GetWorldMarketHotList")
-
-    # Price Info
-    async def get_market_price_info(self, ids: List[str], sids: List[str], convertdate: bool = True, formatprice: bool = False) -> ApiResponse:
-        params = {"id": ids, "sid": sids, "lang": self._api_lang}
-        result = await self._make_request_async("GET", "GetMarketPriceInfo", params=params)
-        return self._convert_price_history(result, convertdate, formatprice)
-
-    def get_market_price_info_sync(self, ids: List[str], sids: List[str], convertdate: bool = True, formatprice: bool = False) -> ApiResponse:
-        params = {"id": ids, "sid": sids, "lang": self._api_lang}
-        result = self._make_request_sync("GET", "GetMarketPriceInfo", params=params)
-        return self._convert_price_history(result, convertdate, formatprice)
-
-    def _convert_price_history(self, result: ApiResponse, convertdate: bool, formatprice: bool) -> ApiResponse:
-        if not result.success or not result.content:
-            return result
-        content_list = [result.content] if isinstance(result.content, dict) else result.content
-        for item in content_list:
-            if "history" in item:
-                new_history = {}
-                for k, v in item["history"].items():
-                    new_key = timestamp_to_datetime(float(k) / 1000).strftime("%Y-%m-%d") if convertdate else k
-                    new_value = f"{v:,}" if formatprice else v
-                    new_history[new_key] = new_value
-                item["history"] = new_history
-        result.content = content_list
-        return result
-
-    # Search
-    async def get_world_market_search_list(self, ids: List[str]) -> ApiResponse:
-        return await self._make_request_async("GET", "GetWorldMarketSearchList", params={"ids": ids, "lang": self._api_lang})
-
-    def get_world_market_search_list_sync(self, ids: List[str]) -> ApiResponse:
-        return self._make_request_sync("GET", "GetWorldMarketSearchList", params={"ids": ids, "lang": self._api_lang})
-
-    # Category List
-    async def get_world_market_list(self, main_category: str, sub_category: str) -> ApiResponse:
-        params = {"mainCategory": main_category, "subCategory": sub_category, "lang": self._api_lang}
-        return await self._make_request_async("GET", "GetWorldMarketList", params=params)
-
-    def get_world_market_list_sync(self, main_category: str, sub_category: str) -> ApiResponse:
-        params = {"mainCategory": main_category, "subCategory": sub_category, "lang": self._api_lang}
-        return self._make_request_sync("GET", "GetWorldMarketList", params=params)
-
-    # Sub List
-    async def get_world_market_sub_list(self, ids: List[str]) -> ApiResponse:
-        return await self._make_request_async("GET", "GetWorldMarketSubList", params={"id": ids, "lang": self._api_lang})
-
-    def get_world_market_sub_list_sync(self, ids: List[str]) -> ApiResponse:
-        return self._make_request_sync("GET", "GetWorldMarketSubList", params={"id": ids, "lang": self._api_lang})
+def cleanup_old_alerts(sent_alerts: dict, hours=1):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - hours * 3600
+    to_delete = [aid for aid, ts in sent_alerts.items() if ts < cutoff]
+    for aid in to_delete:
+        del sent_alerts[aid]
+    if to_delete:
+        with open(DATA_FILE, "w") as f:
+            json.dump(sent_alerts, f, indent=2)
+        print(f"🧹 Cleaned up {len(to_delete)} old alerts.")
 
 
 # ─── Slash Commands ──────────────────────────────────────────────────────
-market_group = app_commands.Group(name="market", description="Marketplace tools and utilities.")
 patch_group = app_commands.Group(name="patch", description="Patch notes settings & tools.")
+boss_group = app_commands.Group(name="boss", description="Boss alert subscriptions & management")
 
-
-@bot.tree.command(name="setupalerts", description="Set the channel for boss alerts (admin only).")
+# --- /boss setupalerts ---
+@boss_group.command(name="setupalerts", description="Set the channel for boss alerts (admin only).")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
 async def setupalerts(interaction: discord.Interaction, channel: discord.TextChannel):
     bot.guild_config[str(interaction.guild_id)] = {"channel_id": channel.id}
-    bot._save_json(CONFIG_FILE, bot.guild_config)
+    save_json(CONFIG_FILE, bot.guild_config)
     await interaction.response.send_message(f"✅ Alerts will now be sent in {channel.mention}.", ephemeral=True)
 
 @setupalerts.error
 async def setupalerts_error(interaction, error):
-    if isinstance(error, discord.app_commands.errors.MissingPermissions):
-        await interaction.response.send_message("❌ You need 'Manage Server' permission to use this command.", ephemeral=True)
+    if isinstance(error, discord.app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You need 'Manage Server' permission.", ephemeral=True)
 
-@bot.tree.command(name="subscribe", description="Subscribe to alerts for a boss.")
+# --- /boss subscribe ---
+@boss_group.command(name="subscribe", description="Subscribe to alerts for a boss.")
 @discord.app_commands.describe(boss="Name of the boss to subscribe to.")
 async def subscribe(interaction: discord.Interaction, boss: str):
     boss = boss.title()
     if boss not in BOSS_NAMES:
-        await interaction.response.send_message("Invalid boss name.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid boss name.", ephemeral=True)
         return
 
-    role = bot.boss_roles.get(boss)
+    guild_roles = bot.boss_roles.get(interaction.guild.id, {})
+    role = guild_roles.get(boss)
     if not role:
-        await interaction.response.send_message("Boss role not found.", ephemeral=True)
+        await interaction.response.send_message("❌ Boss role not found.", ephemeral=True)
         return
 
     member = interaction.user
     if role in member.roles:
-        await interaction.response.send_message(f"You're already subscribed to {boss}.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Already subscribed to {boss}.", ephemeral=True)
         return
 
     await member.add_roles(role, reason="Boss subscription")
     await interaction.response.send_message(f"✅ Subscribed to {boss} alerts!", ephemeral=True)
 
-@bot.tree.command(name="unsubscribe", description="Unsubscribe from alerts for a boss.")
+# --- /boss unsubscribe ---
+@boss_group.command(name="unsubscribe", description="Unsubscribe from alerts for a boss.")
 @discord.app_commands.describe(boss="Name of the boss to unsubscribe from.")
 async def unsubscribe(interaction: discord.Interaction, boss: str):
     boss = boss.title()
     if boss not in BOSS_NAMES:
-        await interaction.response.send_message("Invalid boss name.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid boss name.", ephemeral=True)
         return
 
-    role = bot.boss_roles.get(boss)
+    guild_roles = bot.boss_roles.get(interaction.guild.id, {})
+    role = guild_roles.get(boss)
     if not role:
-        await interaction.response.send_message("Boss role not found.", ephemeral=True)
+        await interaction.response.send_message("❌ Boss role not found.", ephemeral=True)
         return
 
     member = interaction.user
     if role not in member.roles:
-        await interaction.response.send_message(f"You're not subscribed to {boss}.", ephemeral=True)
+        await interaction.response.send_message(f"❌ You're not subscribed to {boss}.", ephemeral=True)
         return
 
     await member.remove_roles(role, reason="Boss unsubscription")
     await interaction.response.send_message(f"❎ Unsubscribed from {boss}.", ephemeral=True)
-    
-@bot.tree.command(name="subscribeall", description="Subscribe to all boss alerts.")
-async def subscribeall(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)  # ⬅️ immediately acknowledge
 
+# --- /boss subscribeall ---
+@boss_group.command(name="subscribeall", description="Subscribe to all boss alerts.")
+async def subscribeall(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     member = interaction.user
     added = 0
 
-    # Make sure all boss roles exist
-    await bot.ensure_boss_roles(interaction.guild)
+    await ensure_boss_roles(interaction.guild)
+    guild_roles = bot.boss_roles.get(interaction.guild.id, {})
 
-    for boss, role in bot.boss_roles.items():
+    for role in guild_roles.values():
         if role not in member.roles:
             try:
                 await member.add_roles(role, reason="Subscribed to all bosses")
@@ -484,19 +329,17 @@ async def subscribeall(interaction: discord.Interaction):
             except Exception as e:
                 print(f"Failed to add {role.name} to {member}: {e}")
 
-    if added == 0:
-        msg = "✅ You're already subscribed to all bosses."
-    else:
-        msg = f"✅ Subscribed to **{added}** bosses."
+    msg = "✅ Already subscribed to all bosses." if added == 0 else f"✅ Subscribed to {added} bosses."
+    await interaction.followup.send(msg, ephemeral=True)
 
-    await interaction.followup.send(msg, ephemeral=True)  # ⬅️ final response
-
-@bot.tree.command(name="unsubscribeall", description="Unsubscribe from all boss alerts.")
+# --- /boss unsubscribeall ---
+@boss_group.command(name="unsubscribeall", description="Unsubscribe from all boss alerts.")
 async def unsubscribeall(interaction: discord.Interaction):
     member = interaction.user
     removed = 0
+    guild_roles = bot.boss_roles.get(interaction.guild.id, {})
 
-    for boss, role in bot.boss_roles.items():
+    for role in guild_roles.values():
         if role in member.roles:
             try:
                 await member.remove_roles(role, reason="Unsubscribed from all bosses")
@@ -504,48 +347,39 @@ async def unsubscribeall(interaction: discord.Interaction):
             except Exception as e:
                 print(f"Failed to remove {role.name} from {member}: {e}")
 
-    if removed == 0:
-        await interaction.response.send_message("You're not subscribed to any boss alerts.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❎ Unsubscribed from **{removed}** bosses.", ephemeral=True)
+    msg = "❌ Not subscribed to any bosses." if removed == 0 else f"❎ Unsubscribed from {removed} bosses."
+    await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.tree.command(name="createroles", description="Manually create any missing boss roles.")
+# --- /boss createroles ---
+@boss_group.command(name="createroles", description="Manually create missing boss roles.")
 @discord.app_commands.checks.has_permissions(manage_guild=True)
 async def createroles(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
-    guild = interaction.guild
-    before = len(guild.roles)
-    await bot.ensure_boss_roles(guild)
-    after = len(guild.roles)
-
+    before = len(interaction.guild.roles)
+    await ensure_boss_roles(interaction.guild)
+    after = len(interaction.guild.roles)
     created_count = after - before
-    if created_count == 0:
-        msg = "✅ All boss roles already exist."
-    else:
-        msg = f"✅ Created **{created_count}** missing boss roles."
-
+    msg = "✅ All boss roles already exist." if created_count == 0 else f"✅ Created {created_count} missing boss roles."
     await interaction.followup.send(msg, ephemeral=True)
-    
-@bot.tree.command(name="testpoll", description="Force the bot to post alerts for the next bosses.")
+
+# --- /boss testpoll ---
+@boss_group.command(name="testpoll", description="Force post alerts for next bosses (testing).")
 async def testpoll(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
     guild_id = str(interaction.guild_id)
     channel_id = bot.guild_config.get(guild_id, {}).get("channel_id")
     channel = bot.get_channel(channel_id)
     if not channel:
-        await interaction.followup.send("Alert channel not set! Use /setupalerts first.", ephemeral=True)
+        await interaction.followup.send("❌ Alert channel not set! Use /boss setupalerts.", ephemeral=True)
         return
 
-    now = datetime.now(timezone.utc)
     try:
         bosses = await fetch_bosses("NA")
         if not bosses:
             await interaction.followup.send("⚠️ No boss data available.", ephemeral=True)
             return
 
-        # Find next spawn per boss
+        now = datetime.now(timezone.utc)
         next_spawns = {}
         for boss in bosses:
             spawn_utc = parse_time_str_to_utc(boss["time_str"])
@@ -554,20 +388,15 @@ async def testpoll(interaction: discord.Interaction):
             if boss["name"] not in next_spawns or spawn_utc < next_spawns[boss["name"]]:
                 next_spawns[boss["name"]] = spawn_utc
 
-        if not next_spawns:
-            await interaction.followup.send("⚠️ No upcoming boss spawns found.", ephemeral=True)
-            return
-
-        # Compose alert messages like the poll loop
+        guild_roles = bot.boss_roles.get(interaction.guild.id, {})
         messages_to_send = []
         for name, spawn in next_spawns.items():
             minutes_until = max(int((spawn - now).total_seconds() // 60), 0)
-            role = bot.boss_roles.get(name)
+            role = guild_roles.get(name)
             mention = role.mention if role else name
             messages_to_send.append(f"⚠️ {mention} spawns in {minutes_until} minutes! [TEST]")
 
         if messages_to_send:
-            # Delete previous alert if exists
             last_msg_id = bot.sent_alert_msg.get(guild_id)
             if last_msg_id:
                 try:
@@ -575,17 +404,14 @@ async def testpoll(interaction: discord.Interaction):
                     await last_msg.delete()
                 except Exception:
                     pass
-
             new_msg = await channel.send("\n".join(messages_to_send))
             bot.sent_alert_msg[guild_id] = new_msg.id
-            bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
-
+            save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
             await interaction.followup.send(f"✅ Test poll sent for {len(messages_to_send)} bosses.", ephemeral=True)
         else:
             await interaction.followup.send("⚠️ No bosses to alert.", ephemeral=True)
-
     except Exception as e:
-        await interaction.followup.send(f"⚠️ Failed to fetch boss timers: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ Failed to fetch boss timers: {e}", ephemeral=True)
 
 
 @patch_group.command(name="setchannel", description="Set the patch notes channel for this server.")
@@ -614,133 +440,9 @@ async def check_patch_now(interaction: discord.Interaction):
         timestamp=datetime.utcnow()
     )
     await interaction.followup.send(embed=embed)
-    
-# ─── PRICE ────────────────────────────────────────────────
-@market_group.command(name="price", description="Check current marketplace price for an item.")
-@app_commands.describe(item="Item name to check")
-async def price(interaction: discord.Interaction, item: str):
-    data = get_item_data(item)
-    if not data:
-        await interaction.response.send_message(f"❌ Item `{item}` not found.")
-        return
 
-    embed = discord.Embed(
-        title=f"📊 Marketplace — {data['name']}",
-        color=discord.Color.blurple(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="💰 Price", value=f"{data['price']:,} silver", inline=True)
-    embed.add_field(name="📦 Stock", value=f"{data['stock']:,}", inline=True)
-    embed.set_footer(text="Marketplace data")
-    await interaction.response.send_message(embed=embed)
+# ───  Map abbreviated weekdays to integers ───────────────────────────────────────────────
 
-# ─── PROFIT ───────────────────────────────────────────────
-@market_group.command(name="profit", description="Calculate flipping profit with or without a value pack.")
-@app_commands.describe(
-    item="Item name",
-    buy_price="Price you plan to buy at",
-    sell_price="Price you plan to sell at",
-    value_pack="Do you have a Value Pack active?"
-)
-async def profit(interaction: discord.Interaction, item: str, buy_price: int, sell_price: int, value_pack: bool):
-    tax_rate = TAX_RATE_VP if value_pack else TAX_RATE_NORMAL
-    tax = int(sell_price * tax_rate)
-    net_profit = (sell_price - tax) - buy_price
-
-    emoji = "✅" if net_profit > 0 else "⚠️"
-    embed = discord.Embed(
-        title=f"💹 Flip Calculator — {item}",
-        color=discord.Color.green() if net_profit > 0 else discord.Color.red(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="🛒 Buy Price", value=f"{buy_price:,} silver", inline=True)
-    embed.add_field(name="🏷 Sell Price", value=f"{sell_price:,} silver", inline=True)
-    embed.add_field(name="📜 Tax Rate", value=f"{int(tax_rate*100)}%", inline=True)
-    embed.add_field(name="💸 Tax", value=f"{tax:,} silver", inline=True)
-    embed.add_field(name=f"{emoji} Net Profit", value=f"{net_profit:,} silver", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-# ─── STOCK ────────────────────────────────────────────────
-@market_group.command(name="stock", description="Check stock trend for an item.")
-@app_commands.describe(item="Item name")
-async def stock(interaction: discord.Interaction, item: str):
-    data = get_item_data(item)
-    if not data:
-        await interaction.response.send_message(f"❌ Item `{item}` not found.")
-        return
-
-    trend = data.get("trend", "📈 No trend data yet")
-    embed = discord.Embed(
-        title=f"📦 Stock — {data['name']}",
-        color=discord.Color.gold(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="Current Stock", value=f"{data['stock']:,}", inline=True)
-    embed.add_field(name="Trend", value=trend, inline=True)
-    await interaction.response.send_message(embed=embed)
-
-# ─── WATCH ────────────────────────────────────────────────
-@market_group.command(name="watch", description="Set a price alert for an item.")
-@app_commands.describe(item="Item name", target_price="Alert price")
-async def watch(interaction: discord.Interaction, item: str, target_price: int):
-    # You’d persist this alert in a file or database
-    await interaction.response.send_message(
-        f"👀 Alert created for `{item}` — I'll notify you when it drops below **{target_price:,} silver**."
-    )
-
-# ─── SEARCH ───────────────────────────────────────────────
-@market_group.command(name="search", description="Search marketplace for items by keyword.")
-@app_commands.describe(keyword="Keyword to search for")
-async def search(interaction: discord.Interaction, keyword: str):
-    results = fake_search_items(keyword)
-    if not results:
-        await interaction.response.send_message(f"🔍 No results for `{keyword}`.")
-        return
-
-    embed = discord.Embed(
-        title=f"🔍 Search Results for '{keyword}'",
-        description="\n".join([f"{i+1}. {name}" for i, name in enumerate(results)]),
-        color=discord.Color.teal()
-    )
-    await interaction.response.send_message(embed=embed)
-
-def fake_search_items(keyword: str):
-    sample_items = ["Ogre Ring", "Black Stone (Weapon)", "Caphras Stone", "Memory Fragment"]
-    return [x for x in sample_items if keyword.lower() in x.lower()]
-
-# ─── SILVERCALC ───────────────────────────────────────────
-@market_group.command(name="silvercalc", description="Calculate total silver cost with or without value pack.")
-@app_commands.describe(
-    item="Item name",
-    quantity="How many you want",
-    value_pack="Do you have a Value Pack active?"
-)
-async def silvercalc(interaction: discord.Interaction, item: str, quantity: int, value_pack: bool):
-    data = get_item_data(item)
-    if not data:
-        await interaction.response.send_message(f"❌ Item `{item}` not found.")
-        return
-
-    tax_rate = TAX_RATE_VP if value_pack else TAX_RATE_NORMAL
-    total_cost = data['price'] * quantity
-    tax_cost = int(total_cost * tax_rate)
-    total_after_tax = total_cost - tax_cost
-
-    embed = discord.Embed(
-        title=f"🧾 Silver Calculator — {data['name']}",
-        color=discord.Color.purple(),
-        timestamp=datetime.utcnow()
-    )
-    embed.add_field(name="Unit Price", value=f"{data['price']:,} silver", inline=True)
-    embed.add_field(name="Quantity", value=f"{quantity:,}", inline=True)
-    embed.add_field(name="Total Cost", value=f"{total_cost:,} silver", inline=False)
-    embed.add_field(name="Tax Rate", value=f"{int(tax_rate*100)}%", inline=True)
-    embed.add_field(name="After Tax", value=f"{total_after_tax:,} silver", inline=True)
-    await interaction.response.send_message(embed=embed)
-
-
-
-# Map abbreviated weekdays to integers
 DAYS_MAP = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 PST = pytz.timezone("US/Pacific")
 
@@ -767,7 +469,8 @@ def parse_time_str_to_utc(time_str):
     return target_dt.astimezone(pytz.utc)
 
 # ─── Refresh Boss Data Loop ─────────────────────────────────────────────
-@tasks.loop(hours=1)
+
+@tasks.loop(hours=24)
 async def refresh_boss_data():
     try:
         bot.boss_data = await fetch_bosses("NA")  # fetch fresh data
@@ -784,7 +487,7 @@ async def refresh_boss_data():
 @tasks.loop(seconds=POLL_INTERVAL)
 async def poll_and_alert():
     await bot.wait_until_ready()
-    bot.cleanup_old_alerts(hours=1)
+    cleanup_old_alerts(bot.sent_alerts, hours=1)
 
     bosses = getattr(bot, "boss_data", None)
     if not bosses:
@@ -792,7 +495,16 @@ async def poll_and_alert():
 
     now = datetime.now(timezone.utc)
 
-    for guild_id, config in bot.guild_config.items():
+    for guild_id_str, config in bot.guild_config.items():
+        guild_id = int(guild_id_str)
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+
+        # Ensure roles exist for this guild
+        await ensure_boss_roles(guild)
+        roles = bot.boss_roles.get(guild_id, {})
+
         channel_id = config.get("channel_id")
         channel = bot.get_channel(channel_id)
         if not channel:
@@ -810,7 +522,7 @@ async def poll_and_alert():
                 if alert_id in bot.sent_alerts:
                     continue  # skip duplicate
 
-                role = bot.boss_roles.get(name)
+                role = roles.get(name)
                 mention = role.mention if role else name
                 messages_to_send.append(f"⚠️ {mention} spawns in {minutes_until} minutes!")
 
@@ -818,10 +530,10 @@ async def poll_and_alert():
                 bot.sent_alerts[alert_id] = now.timestamp()
 
         if messages_to_send:
-            bot._save_json(DATA_FILE, bot.sent_alerts)
+            save_json(DATA_FILE, bot.sent_alerts)
 
             # Delete previous alert if it exists
-            last_msg_id = bot.sent_alert_msg.get(guild_id)
+            last_msg_id = bot.sent_alert_msg.get(str(guild_id))
             if last_msg_id:
                 try:
                     last_msg = await channel.fetch_message(last_msg_id)
@@ -832,70 +544,101 @@ async def poll_and_alert():
             # Send new alert and store its message ID
             try:
                 new_msg = await channel.send("\n".join(messages_to_send))
-                bot.sent_alert_msg[guild_id] = new_msg.id
-                bot._save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
+                bot.sent_alert_msg[str(guild_id)] = new_msg.id
+                save_json(ALERT_MSG_FILE, bot.sent_alert_msg)
             except Exception as e:
-                print(f"❌ Failed to send alert in guild {guild_id}: {e}")
+                print(f"❌ Failed to send alert in guild {guild.name}: {e}")
 
-# ─── On Ready ─────────────────────────────────────────────────────────
+
+# ─── Bot Startup ───────────────────────────────────────────────
+                
+@bot.event
+async def setup_hook():
+    # 1) Add groups to the tree (must be done after group's commands defined)
+    try:
+        bot.tree.add_command(boss_group)
+        bot.tree.add_command(patch_group)
+        print("✅ Added command groups to tree: market, patch")
+    except Exception as e:
+        print(f"⚠️ Failed to add command groups: {e}")
+
+    # 2) Sync commands to each guild (preferred during development)
+    #    This registers the commands for each guild the bot is in.
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=discord.Object(id=guild.id))
+            print(f"🔁 Synced commands to guild: {guild.name} ({guild.id})")
+        except Exception as e:
+            print(f"⚠️ Failed to sync commands to guild {guild.name}: {e}")
+
+    # 3) Optionally sync global commands once (can be slow to propagate).
+    try:
+        await bot.tree.sync()
+        print("🌐 Synced global commands")
+    except Exception as e:
+        print(f"⚠️ Failed to sync global commands: {e}")
+
+    # 4) Ensure boss roles exist in all guilds
+        try:
+            await ensure_boss_roles(guild)   # ✅ call the function directly
+        except Exception as e:
+            print(f"⚠️ ensure_boss_roles error in {guild.name}: {e}")
+
+    # 5) Fetch initial boss data (so poll loop has something immediately)
+    try:
+        bot.boss_data = await fetch_bosses("NA")
+        if bot.boss_data:
+            print(f"✅ Initial boss data loaded ({len(bot.boss_data)} entries)")
+        else:
+            print("⚠️ Initial boss data empty")
+    except Exception as e:
+        print(f"⚠️ Failed to fetch initial boss data: {e}")
+
+    # 6) Start background loops (if not already running)
+    try:
+        if not refresh_boss_data.is_running():
+            refresh_boss_data.start()
+            print("⏱️ Started refresh_boss_data (hourly)")
+    except Exception as e:
+        print(f"⚠️ Failed to start refresh_boss_data: {e}")
+
+    try:
+        if not poll_and_alert.is_running():
+            poll_and_alert.start()
+            print(f"⏱️ Started poll_and_alert (every {POLL_INTERVAL} seconds)")
+    except Exception as e:
+        print(f"⚠️ Failed to start poll_and_alert: {e}")
+
+    # patch_notes_check expects the bot instance as argument in its start()
+    try:
+        if not patch_notes_check.is_running():
+            patch_notes_check.start(bot)
+            print("⏱️ Started patch_notes_check (every 30 minutes)")
+    except Exception as e:
+        print(f"⚠️ Failed to start patch_notes_check: {e}")
+
+    print("✅ setup_hook complete")
+
+# ─── On Ready ──────────────────────────────────
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} ({bot.user.id})")
     print("UTC now:", datetime.now(timezone.utc))
-    print("Local now:", datetime.now())  # local time
-    bot.tree.add_command(patch_group)
-    bot.tree.add_command(market_group)
-
-    # Ensure all boss roles exist
-    for guild in bot.guilds:
-        await bot.tree.sync(guild=guild)
-        print(f"[⚡] Synced commands to {guild.name}")
-        try:
-            await bot.ensure_boss_roles(guild)
-        except Exception as e:
-            print(f"⚠️ Failed to ensure boss roles for {guild.name}: {e}")
-
-    # Fetch next boss timers
+    print("Local now:", datetime.now())
+            
+    # Sync slash commands (market, patch, boss, etc.)
     try:
-        bot.boss_data = await fetch_bosses("NA")
-        now = datetime.now(timezone.utc)
-
-        if bot.boss_data:
-            # Create a dict to track next spawn per boss
-            next_spawns = {}
-            for boss in bot.boss_data:
-                try:
-                    spawn_utc = parse_time_str_to_utc(boss["time_str"])
-                    if spawn_utc < now:
-                        continue  # skip past spawns
-
-                    # Only keep the earliest spawn per boss
-                    if boss["name"] not in next_spawns or spawn_utc < next_spawns[boss["name"]]:
-                        next_spawns[boss["name"]] = spawn_utc
-                except Exception as e:
-                    print(f"⚠️ Failed to parse spawn for boss {boss.get('name')}: {e}")
-
-            if next_spawns:
-                print("🕒 Upcoming boss spawns:")
-                for name, spawn in sorted(next_spawns.items(), key=lambda x: x[1]):
-                    minutes_left = max(int((spawn - now).total_seconds() // 60), 0)
-                    hours, mins = divmod(minutes_left, 60)
-                    print(f" - {name}: spawns at {spawn} UTC (in {hours}h {mins}m)")
-            else:
-                print("⚠️ No upcoming boss spawns found.")
-        else:
-            print("⚠️ No boss data available.")
-
+        synced = await bot.tree.sync()
+        print(f"🌐 Synced {len(synced)} global slash commands.")
     except Exception as e:
-        print("⚠️ Failed to fetch boss timers:", e)
+        print(f"❌ Failed to sync commands: {e}")
 
-    # Start the polling loop only if it's not already running
+    # (Optional) Start any loops
     if not poll_and_alert.is_running():
         poll_and_alert.start()
-        print(f"⏱️ Started poll_and_alert loop (every {POLL_INTERVAL} seconds)")
-
-
-
+    if not patch_notes_check.is_running():
+        patch_notes_check.start()
 
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
